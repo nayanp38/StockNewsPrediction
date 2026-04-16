@@ -29,8 +29,16 @@ class RetrievalService:
             key=lambda item: float(item[2]),
             reverse=True,
         )
-        candidate_count = min(len(ranked), max((top_k or self.settings.top_k_articles) * 3, self.settings.top_k_articles))
+
+        effective_top_k = top_k or self.settings.top_k_articles
+        candidate_count = min(len(ranked), max(effective_top_k * 3, self.settings.top_k_articles))
         candidates = ranked[:candidate_count]
+
+        # Apply similarity floor but always keep at least effective_top_k candidates
+        # so we never return an empty result when news is weakly aligned.
+        strong_candidates = [item for item in candidates if float(item[2]) >= self.settings.similarity_floor]
+        if len(strong_candidates) >= effective_top_k:
+            candidates = strong_candidates
 
         cluster_assignments = self._cluster([vector for _, vector, _ in candidates])
         retrieved: list[RetrievedArticle] = []
@@ -48,7 +56,7 @@ class RetrievalService:
                 )
             )
 
-        return self._select_diverse_top_k(retrieved, top_k or self.settings.top_k_articles)
+        return self._select_diverse_top_k(retrieved, effective_top_k)
 
     def _cluster(self, vectors: list[np.ndarray]) -> list[int]:
         if len(vectors) < 2:
@@ -59,11 +67,13 @@ class RetrievalService:
         model = KMeans(n_clusters=cluster_count, random_state=42, n_init=10)
         return model.fit_predict(np.array(vectors)).tolist()
 
-    @staticmethod
-    def _ticker_relevance(article: NewsArticle, ticker: str, similarity: float) -> float:
-        direct_mention_bonus = 0.15 if ticker in article.tickers else 0.0
+    def _ticker_relevance(self, article: NewsArticle, ticker: str, similarity: float) -> float:
+        # Multiplicative mention bonus gates on similarity so a low-similarity
+        # article cannot jump the queue purely by mentioning the ticker.
+        direct_mention_multiplier = 1.0 + (self.settings.direct_mention_bonus if ticker in article.tickers else 0.0)
         sentiment_score = article.ticker_sentiment.get(ticker, article.overall_sentiment_score)
-        return similarity + direct_mention_bonus + 0.1 * sentiment_score
+        ticker_only_penalty = self.settings.ticker_only_penalty if article.source_type == "ticker" else 0.0
+        return similarity * direct_mention_multiplier + self.settings.sentiment_relevance_weight * sentiment_score - ticker_only_penalty
 
     @staticmethod
     def _select_diverse_top_k(retrieved: list[RetrievedArticle], top_k: int) -> list[RetrievedArticle]:

@@ -17,6 +17,7 @@ class NewsArticle(BaseModel):
     overall_sentiment_label: str = "Neutral"
     tickers: list[str] = Field(default_factory=list)
     ticker_sentiment: dict[str, float] = Field(default_factory=dict)
+    source_type: Literal["topic", "ticker", "both"] = "topic"
 
     @property
     def combined_text(self) -> str:

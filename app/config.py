@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     regression_horizon_days: int = 5
     historical_period: str = "2y"
     benchmark_ticker: str = "SPY"
+    similarity_floor: float = 0.30
+    ticker_only_penalty: float = 0.08
+    direct_mention_bonus: float = 0.05
+    sentiment_relevance_weight: float = 0.05
 
     model_config = SettingsConfigDict(populate_by_name=True, extra="ignore")
 

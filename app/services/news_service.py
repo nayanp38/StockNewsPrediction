@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 import time
 from typing import Any
 
@@ -11,17 +12,156 @@ from app.models.schemas import NewsArticle
 
 
 class NewsService:
+    _TOPIC_KEYWORDS: dict[str, tuple[str, ...]] = {
+        "economy_monetary": (
+            "fed",
+            "federal reserve",
+            "interest rate",
+            "rate cut",
+            "rate hike",
+            "monetary policy",
+            "quantitative easing",
+            "inflation",
+            "cpi",
+            "pce",
+        ),
+        "economy_macro": (
+            "macro",
+            "gdp",
+            "recession",
+            "unemployment",
+            "jobs report",
+            "consumer spending",
+            "economic growth",
+            "economic slowdown",
+        ),
+        "financial_markets": (
+            "stocks",
+            "equities",
+            "bond",
+            "bonds",
+            "treasury",
+            "yield",
+            "volatility",
+            "risk off",
+            "risk-on",
+            "market rally",
+        ),
+        "finance": (
+            "bank",
+            "banks",
+            "banking",
+            "lending",
+            "loan",
+            "credit",
+            "financial sector",
+            "capital markets",
+        ),
+        "technology": (
+            "ai",
+            "artificial intelligence",
+            "chip",
+            "chips",
+            "semiconductor",
+            "software",
+            "cloud",
+            "data center",
+        ),
+        "mergers_and_acquisitions": (
+            "acquisition",
+            "acquire",
+            "takeover",
+            "merger",
+            "buyout",
+            "m&a",
+        ),
+        "earnings": (
+            "earnings",
+            "eps",
+            "guidance",
+            "revenue",
+            "quarterly results",
+            "q1",
+            "q2",
+            "q3",
+            "q4",
+        ),
+        "ipo": (
+            "ipo",
+            "initial public offering",
+            "go public",
+            "listing",
+        ),
+        "energy_transportation": (
+            "oil",
+            "gas",
+            "energy",
+            "opec",
+            "shipping",
+            "airline",
+            "transportation",
+            "freight",
+        ),
+        "manufacturing": (
+            "manufacturing",
+            "factory",
+            "industrial output",
+            "production",
+            "supply chain",
+        ),
+        "real_estate": (
+            "real estate",
+            "housing",
+            "home sales",
+            "mortgage",
+            "commercial real estate",
+        ),
+        "retail_wholesale": (
+            "retail",
+            "wholesale",
+            "consumer demand",
+            "ecommerce",
+            "same-store sales",
+        ),
+        "life_sciences": (
+            "biotech",
+            "pharma",
+            "drug trial",
+            "fda",
+            "healthcare",
+            "medical device",
+        ),
+        "blockchain": (
+            "blockchain",
+            "bitcoin",
+            "ethereum",
+            "crypto",
+            "token",
+            "web3",
+        ),
+    }
+    _DEFAULT_TOPICS = ("economy_macro", "financial_markets", "finance")
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._min_request_interval_seconds = 1.1
         self._last_request_at: float | None = None
 
     def fetch_news(self, query: str, tickers: list[str], limit: int = 50) -> list[NewsArticle]:
-        articles = self._fetch_by_topic(query, limit=limit)
+        topic_articles = self._fetch_by_topic(query, limit=limit)
         ticker_articles = self._fetch_by_tickers(tickers, limit=limit)
+
         deduped: dict[str, NewsArticle] = {}
-        for article in articles + ticker_articles:
+        for article in topic_articles:
+            article.source_type = "topic"
             deduped[article.article_id] = article
+        for article in ticker_articles:
+            existing = deduped.get(article.article_id)
+            if existing is not None:
+                existing.source_type = "both"
+            else:
+                article.source_type = "ticker"
+                deduped[article.article_id] = article
         return list(deduped.values())
 
     def _fetch_by_topic(self, query: str, limit: int) -> list[NewsArticle]:
@@ -97,9 +237,30 @@ class NewsService:
 
     @staticmethod
     def _topics_from_query(query: str) -> str:
-        words = [word.strip(".,!?").lower() for word in query.split()]
-        curated = [word for word in words if len(word) > 4][:5]
-        return ",".join(curated) if curated else "economy"
+        tokens = re.findall(r"[a-z0-9]+", query.lower())
+        if not tokens:
+            return ",".join(NewsService._DEFAULT_TOPICS)
+
+        token_set = set(tokens)
+        normalized_text = " ".join(tokens)
+        scored_topics: list[tuple[str, int]] = []
+        for topic, keywords in NewsService._TOPIC_KEYWORDS.items():
+            score = 0
+            for keyword in keywords:
+                if " " in keyword:
+                    if keyword in normalized_text:
+                        score += 1
+                elif keyword in token_set:
+                    score += 1
+            if score > 0:
+                scored_topics.append((topic, score))
+
+        if not scored_topics:
+            return ",".join(NewsService._DEFAULT_TOPICS)
+
+        scored_topics.sort(key=lambda item: (-item[1], item[0]))
+        top_topics = [topic for topic, _ in scored_topics[:3]]
+        return ",".join(top_topics)
 
     @staticmethod
     def _parse_timestamp(value: str | None) -> datetime | None:

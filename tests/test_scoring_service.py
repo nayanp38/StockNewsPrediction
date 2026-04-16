@@ -41,3 +41,41 @@ def test_compute_overall_and_ticker_scores() -> None:
     assert round(overall, 2) == 0.70
     assert scores[0].ticker == "NVDA"
     assert scores[0].combined_score > scores[1].combined_score
+
+
+def test_sentiment_drives_combined_score_sign() -> None:
+    articles = [
+        RetrievedArticle(
+            article=NewsArticle(
+                article_id="neg",
+                title="Banks face downgrade",
+                summary="Negative outlook weighs on bank names",
+                tickers=["GS"],
+                overall_sentiment_score=-0.5,
+                ticker_sentiment={"GS": -0.6},
+            ),
+            similarity_score=0.7,
+            cluster_id=0,
+            ticker_relevance={"GS": 0.5},
+        ),
+        RetrievedArticle(
+            article=NewsArticle(
+                article_id="weak_pos",
+                title="Unrelated retail blurb",
+                summary="Some weak positivity elsewhere",
+                tickers=["GS"],
+                overall_sentiment_score=0.2,
+                ticker_sentiment={"GS": 0.2},
+            ),
+            similarity_score=0.2,
+            cluster_id=1,
+            ticker_relevance={"GS": 0.3},
+        ),
+    ]
+
+    service = ScoringService()
+    scores = service.compute_ticker_scores(articles, ["GS"])
+
+    # Similarity-weighted: the stronger-similarity negative article should dominate.
+    assert scores[0].ticker == "GS"
+    assert scores[0].sentiment_score < 0

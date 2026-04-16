@@ -33,13 +33,25 @@ class PredictionService:
     ) -> TickerPrediction:
         current_price = self.market_data_service.latest_close(ticker_score.ticker)
         regression_move = self._predict_price_move(ticker_score.ticker)
-        directional_signal = 0.65 * ticker_score.combined_score + 0.35 * overall_semantic_score
 
-        magnitude = abs(regression_move) * (0.6 + min(abs(directional_signal), 1.0))
+        # Direction is driven by news sentiment (signed). Semantic relevance scales
+        # how much we trust that news signal. Base drift from the price-only
+        # regression is only used when news evidence is too weak to be informative.
+        sentiment_signal = float(ticker_score.sentiment_score)
+        semantic_strength = max(0.0, min(1.0, float(ticker_score.semantic_score)))
+        event_relevance = max(0.0, min(1.0, float(overall_semantic_score)))
+        news_trust = 0.7 * semantic_strength + 0.3 * event_relevance
+
+        news_directional_signal = sentiment_signal * news_trust
+        directional_signal = news_directional_signal
+        if abs(news_directional_signal) < 0.05:
+            directional_signal = news_directional_signal + (1.0 - news_trust) * regression_move
+
+        magnitude = abs(regression_move) * (0.6 + min(abs(sentiment_signal), 1.0) + 0.4 * semantic_strength)
         signed_percent_move = magnitude if directional_signal >= 0 else -magnitude
         predicted_price = current_price * (1.0 + signed_percent_move)
         direction = "UP" if signed_percent_move >= 0 else "DOWN"
-        confidence = logistic_confidence(abs(directional_signal))
+        confidence = logistic_confidence(abs(directional_signal) + 0.5 * news_trust)
         explanation = self._build_explanation(ticker_score, overall_semantic_score, signed_percent_move, supporting_articles)
 
         return TickerPrediction(
