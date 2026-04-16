@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import time
 from typing import Any
 
 import requests
@@ -12,6 +13,8 @@ from app.models.schemas import NewsArticle
 class NewsService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self._min_request_interval_seconds = 1.1
+        self._last_request_at: float | None = None
 
     def fetch_news(self, query: str, tickers: list[str], limit: int = 50) -> list[NewsArticle]:
         articles = self._fetch_by_topic(query, limit=limit)
@@ -46,7 +49,15 @@ class NewsService:
         return self._parse_articles(payload.get("feed", []))
 
     def _get(self, params: dict[str, str]) -> dict[str, Any]:
+        # Alpha Vantage free tier allows 1 request/second bursts.
+        if self._last_request_at is not None:
+            elapsed = time.monotonic() - self._last_request_at
+            wait_seconds = self._min_request_interval_seconds - elapsed
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+
         response = requests.get(self.settings.alpha_vantage_base_url, params=params, timeout=30)
+        self._last_request_at = time.monotonic()
         response.raise_for_status()
         payload = response.json()
         if "Information" in payload or "Note" in payload:
