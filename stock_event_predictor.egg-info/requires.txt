@@ -1,0 +1,13 @@
+numpy>=1.26
+pandas>=2.2
+pydantic>=2.7
+pydantic-settings>=2.3
+python-dotenv>=1.0
+requests>=2.32
+scikit-learn>=1.5
+sentence-transformers>=3.0
+typer>=0.12
+yfinance>=0.2.54
+
+[dev]
+pytest>=8.2
