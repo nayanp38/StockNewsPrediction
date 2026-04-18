@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from app.config import Settings
 from app.models.schemas import NewsArticle, RetrievedArticle
 from app.services.scoring_service import ScoringService
 
@@ -79,3 +80,28 @@ def test_sentiment_drives_combined_score_sign() -> None:
     # Similarity-weighted: the stronger-similarity negative article should dominate.
     assert scores[0].ticker == "GS"
     assert scores[0].sentiment_score < 0
+
+
+def test_untagged_sentiment_is_dampened() -> None:
+    # The article is bullish for PDC only; NVDA is not tagged on it.
+    article = RetrievedArticle(
+        article=NewsArticle(
+            article_id="promo",
+            title="Perpetuals.com launches AI platform",
+            summary="Very bullish for PDC",
+            tickers=["PDC"],
+            overall_sentiment_score=0.8,
+            ticker_sentiment={"PDC": 0.8},
+        ),
+        similarity_score=0.5,
+        cluster_id=0,
+        ticker_relevance={"NVDA": 0.5, "PDC": 0.5},
+    )
+
+    settings = Settings(ALPHAVANTAGE_API_KEY="", untagged_sentiment_weight=0.25)
+    service = ScoringService(settings)
+    scores = service.compute_ticker_scores([article], ["NVDA"])
+
+    # 0.25 * overall_sentiment (0.8) = 0.2 for NVDA since ticker isn't tagged.
+    assert scores[0].ticker == "NVDA"
+    assert abs(scores[0].sentiment_score - 0.2) < 1e-6

@@ -2,12 +2,22 @@ from __future__ import annotations
 
 import numpy as np
 
+from app.config import Settings
 from app.models.schemas import RetrievedArticle, TickerScore
 
 
 class ScoringService:
     SEMANTIC_WEIGHT = 0.5
     SENTIMENT_WEIGHT = 0.5
+
+    def __init__(self, settings: Settings | None = None) -> None:
+        self.settings = settings
+
+    @property
+    def _untagged_sentiment_weight(self) -> float:
+        if self.settings is None:
+            return 0.25
+        return float(self.settings.untagged_sentiment_weight)
 
     def compute_overall_semantic_score(self, retrieved_articles: list[RetrievedArticle]) -> float:
         if not retrieved_articles:
@@ -23,6 +33,7 @@ class ScoringService:
         weight_sum = float(similarities.sum())
         weights = (similarities / weight_sum) if weight_sum > 0 else None
 
+        untagged_weight = self._untagged_sentiment_weight
         for ticker in [ticker.upper() for ticker in tickers]:
             semantic_components = np.array(
                 [article.ticker_relevance.get(ticker, 0.0) for article in retrieved_articles],
@@ -30,7 +41,7 @@ class ScoringService:
             )
             sentiment_components = np.array(
                 [
-                    article.article.ticker_sentiment.get(ticker, article.article.overall_sentiment_score)
+                    self._resolve_ticker_sentiment(article, ticker, untagged_weight)
                     for article in retrieved_articles
                 ],
                 dtype=float,
@@ -57,3 +68,16 @@ class ScoringService:
                 )
             )
         return scores
+
+    @staticmethod
+    def _resolve_ticker_sentiment(
+        retrieved: RetrievedArticle,
+        ticker: str,
+        untagged_weight: float,
+    ) -> float:
+        article = retrieved.article
+        if ticker in article.ticker_sentiment:
+            return float(article.ticker_sentiment[ticker])
+        # Ticker was not tagged on this article; dampen overall sentiment so
+        # unrelated bullish/bearish stories do not dominate the target ticker.
+        return untagged_weight * float(article.overall_sentiment_score)

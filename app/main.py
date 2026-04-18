@@ -15,6 +15,7 @@ from app.services.pipeline_service import PipelineService
 from app.services.prediction_service import PredictionService
 from app.services.retrieval_service import RetrievalService
 from app.services.scoring_service import ScoringService
+from app.services.sentiment_service import SentimentService
 
 cli = typer.Typer(help="Predict stock impact from a hypothetical future event.")
 
@@ -47,10 +48,11 @@ def _normalize_tickers(raw_tickers: list[str]) -> list[str]:
 def build_pipeline() -> PipelineService:
     settings = get_settings()
     embedding_service = EmbeddingService(settings)
-    news_service = NewsService(settings)
+    sentiment_service = SentimentService(settings)
+    news_service = NewsService(settings, sentiment_service=sentiment_service)
     market_data_service = MarketDataService(settings)
     retrieval_service = RetrievalService(settings, embedding_service)
-    scoring_service = ScoringService()
+    scoring_service = ScoringService(settings)
     prediction_service = PredictionService(settings, market_data_service)
     return PipelineService(news_service, retrieval_service, scoring_service, prediction_service)
 
