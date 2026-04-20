@@ -49,7 +49,7 @@ def build_pipeline() -> PipelineService:
     settings = get_settings()
     embedding_service = EmbeddingService(settings)
     sentiment_service = SentimentService(settings)
-    news_service = NewsService(settings, sentiment_service=sentiment_service)
+    news_service = NewsService(settings, sentiment_annotator=sentiment_service)
     market_data_service = MarketDataService(settings)
     retrieval_service = RetrievalService(settings, embedding_service)
     scoring_service = ScoringService(settings)
@@ -89,16 +89,26 @@ def _format_report(response: EventPredictionResponse) -> str:
 
         for article_index, retrieved in enumerate(prediction.supporting_articles, start=1):
             article = retrieved.article
-            ticker_relevance = retrieved.ticker_relevance.get(prediction.ticker, retrieved.similarity_score)
-            ticker_sentiment = article.ticker_sentiment.get(prediction.ticker, article.overall_sentiment_score)
+            ticker_relevance = retrieved.ticker_relevance.get(
+                prediction.ticker, retrieved.similarity_score
+            )
+            if prediction.ticker in article.ticker_sentiment:
+                ticker_sentiment_display = f"{article.ticker_sentiment[prediction.ticker]:+.3f}"
+            else:
+                # No ticker-local text on this article for FinBERT to score;
+                # show `n/a` rather than another ticker's sentiment.
+                ticker_sentiment_display = "n/a"
             lines.append(f"  {article_index}) {article.title or 'Untitled'}")
-            lines.append(f"     Source: {article.source or 'Unknown'} | Published: {_format_timestamp(article.time_published)}")
+            lines.append(
+                f"     Source: {article.source or 'Unknown'} | "
+                f"Published: {_format_timestamp(article.time_published)}"
+            )
             lines.append(
                 "     Scores: "
                 f"similarity={retrieved.similarity_score:.3f}, "
                 f"ticker_relevance={ticker_relevance:.3f}, "
-                f"ticker_sentiment={ticker_sentiment:.3f}, "
-                f"overall_sentiment={article.overall_sentiment_score:.3f}"
+                f"ticker_sentiment={ticker_sentiment_display}, "
+                f"overall_sentiment={article.overall_sentiment_score:+.3f}"
             )
             lines.append(f"     Sentiment Label: {article.overall_sentiment_label}")
             lines.append(f"     Tickers Mentioned: {', '.join(article.tickers) if article.tickers else 'None'}")
