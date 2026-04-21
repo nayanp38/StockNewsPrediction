@@ -6,7 +6,7 @@ import logging
 import re
 import time
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -14,10 +14,7 @@ import requests
 
 from app.config import Settings
 from app.models.schemas import NewsArticle
-
-# Forward reference to avoid a hard import cycle. SentimentService duck-types
-# against this via its `annotate(list[NewsArticle])` method.
-SentimentAnnotator = Any  # pragma: no cover
+from app.services.sentiment_service import SentimentService
 
 logger = logging.getLogger(__name__)
 
@@ -31,113 +28,148 @@ _STOPWORDS: frozenset[str] = frozenset(
 
 
 class NewsDataError(RuntimeError):
-    """Raised when MarketAux returns an error we cannot recover from."""
+    """Raised when NewsData.io returns an error we cannot recover from."""
 
 
 class NewsCreditBudgetError(NewsDataError):
-    """Raised when the configured call budget would be exceeded."""
+    """Raised when the configured credit budget would be exceeded."""
 
 
 class NewsService:
-    """Fetches articles from MarketAux, one call per requested ticker.
+    """Fetches news articles from NewsData.io and annotates them with local sentiment.
 
-    Each call constrains BOTH ``symbols=TICKER`` and ``search=<query>``, so
-    every article returned is guaranteed to (a) tag the ticker and (b) match
-    the event query. We harvest the ticker's aliases and body-level highlight
-    snippets so ``SentimentService`` can run FinBERT on ticker-local text.
-
-    MarketAux's aggregate sentiment numbers are deliberately ignored -- they
-    mix tone across every entity in the article, which leaks unrelated
-    sentiment into the target ticker's score.
+    The public surface (`fetch_news(query, tickers, limit)`) matches the legacy
+    Alpha Vantage service, so the rest of the pipeline is unchanged.
     """
 
-    _NEWS_PATH = "/news/all"
+    _MARKET_PATH = "/market"
+    _LATEST_PATH = "/latest"
+    _DEFAULT_CATEGORY = "business"
+    _TECH_KEYWORDS: frozenset[str] = frozenset(
+        {"ai", "chip", "chips", "semiconductor", "semiconductors", "software",
+         "cloud", "datacenter", "robotics", "cyber", "cybersecurity"}
+    )
 
     def __init__(
         self,
         settings: Settings,
-        sentiment_annotator: SentimentAnnotator | None = None,
+        sentiment_service: SentimentService | None = None,
     ) -> None:
         self.settings = settings
-        self._sentiment_annotator = sentiment_annotator
+        self.sentiment_service = sentiment_service or SentimentService(settings)
         self._last_request_at: float | None = None
-        self._minute_timestamps: deque[float] = deque()
-        self._daily_calls_used: int = 0
+        self._request_timestamps: deque[float] = deque()
+        self._daily_credits_used: int = 0
         self._daily_window_start: float = time.time()
 
-        self._cache_dir: Path = settings.cache_dir / "marketaux"
+        self._cache_dir: Path = settings.cache_dir / "newsdata"
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
     def fetch_news(
         self,
         query: str,
         tickers: list[str],
-        limit: int = 50,  # retained for signature compat; unused
+        limit: int = 50,  # retained for signature compat; actual size from settings
     ) -> list[NewsArticle]:
-        if not self.settings.marketaux_api_token:
+        if not self.settings.news_api_key:
             raise NewsDataError(
-                "NEW_NEWS is not set. Add your MarketAux API token to .env to "
-                "enable news retrieval."
+                "NEWS_API_KEY is not set. Add it to your .env to use NewsData.io."
             )
 
-        size = max(1, min(self.settings.marketaux_articles_per_call, 50))
-        normalized_tickers = sorted({t.upper() for t in tickers if t})
+        size = max(1, min(self.settings.news_articles_per_call, 50))
+        normalized_tickers = sorted({ticker.upper() for ticker in tickers if ticker})
+
+        ticker_articles = self._fetch_ticker_anchored(query, normalized_tickers, size)
+        topic_articles = self._fetch_event_anchored(query, size)
 
         merged: dict[str, NewsArticle] = {}
-        for ticker in normalized_tickers:
-            for article in self._fetch_for_ticker(query=query, ticker=ticker, size=size):
-                if not self._is_fresh_enough(article):
-                    continue
-                existing = merged.get(article.article_id)
-                if existing is None:
-                    merged[article.article_id] = article
-                else:
-                    # Same article returned for multiple tickers -- merge
-                    # ticker-specific metadata without overwriting.
-                    self._merge_article(existing, article)
+        for article in topic_articles:
+            article.source_type = "topic"
+            merged[article.article_id] = article
+        for article in ticker_articles:
+            existing = merged.get(article.article_id)
+            if existing is not None:
+                existing.source_type = "both"
+            else:
+                article.source_type = "ticker"
+                merged[article.article_id] = article
 
         articles = list(merged.values())
-        if self._sentiment_annotator is not None:
-            self._sentiment_annotator.annotate(articles)
-        for article in articles:
-            self._apply_labels(article)
+        self._populate_ticker_tags(articles, normalized_tickers)
+        self.sentiment_service.annotate(articles)
         return articles
 
-    # ------------------------------------------------------------------
-    # HTTP fetch
-    # ------------------------------------------------------------------
-    def _fetch_for_ticker(
-        self, query: str, ticker: str, size: int
+    def _fetch_ticker_anchored(
+        self, query: str, tickers: list[str], size: int
     ) -> list[NewsArticle]:
+        if not tickers:
+            return []
         params = self._base_params(size=size)
-        params["symbols"] = ticker
-        params["filter_entities"] = "true"
-        params["must_have_entities"] = "true"
-        search_clause = self._build_search_clause(query)
-        if search_clause:
-            params["search"] = search_clause
-        payload = self._call(self._NEWS_PATH, params)
-        return self._parse_articles(payload.get("data", []))
+        params["symbol"] = ",".join(tickers[:5])
+        q = self._build_query_string(query)
+        if q:
+            params["q"] = q
+        payload = self._call_with_fallback(
+            primary_path=self._MARKET_PATH,
+            primary_params=params,
+            fallback_path=self._LATEST_PATH,
+            fallback_params=self._latest_params_for_tickers(query, tickers, size),
+        )
+        return self._parse_articles(payload.get("results", []))
+
+    def _fetch_event_anchored(self, query: str, size: int) -> list[NewsArticle]:
+        params = self._base_params(size=size)
+        q = self._build_query_string(query)
+        if q:
+            params["q"] = q
+        params["category"] = self._category_for_query(query)
+        payload = self._call(self._LATEST_PATH, params)
+        return self._parse_articles(payload.get("results", []))
+
+    def _latest_params_for_tickers(
+        self, query: str, tickers: list[str], size: int
+    ) -> dict[str, str]:
+        params = self._base_params(size=size)
+        ticker_clause = " OR ".join(tickers[:5])
+        query_clause = self._build_query_string(query)
+        if query_clause:
+            params["q"] = f"({ticker_clause}) AND ({query_clause})"[:512]
+        else:
+            params["q"] = ticker_clause[:512]
+        return params
 
     def _base_params(self, size: int) -> dict[str, str]:
-        params: dict[str, str] = {
-            "api_token": self.settings.marketaux_api_token,
-            "language": self.settings.marketaux_language,
-            "limit": str(size),
+        return {
+            "apikey": self.settings.news_api_key,
+            "language": "en",
+            "removeduplicate": "1",
+            "sort": "relevancy",
+            "size": str(size),
         }
-        if self.settings.marketaux_published_after:
-            params["published_after"] = self.settings.marketaux_published_after
-        elif self.settings.max_article_age_days > 0:
-            cutoff = datetime.now(timezone.utc) - timedelta(
-                days=self.settings.max_article_age_days
+
+    def _category_for_query(self, query: str) -> str:
+        tokens = {tok.lower() for tok in re.findall(r"[A-Za-z]+", query)}
+        if tokens & self._TECH_KEYWORDS:
+            return "business,technology"
+        return self._DEFAULT_CATEGORY
+
+    def _call_with_fallback(
+        self,
+        primary_path: str,
+        primary_params: dict[str, str],
+        fallback_path: str,
+        fallback_params: dict[str, str],
+    ) -> dict[str, Any]:
+        try:
+            return self._call(primary_path, primary_params)
+        except NewsCreditBudgetError:
+            raise
+        except NewsDataError as exc:
+            logger.warning(
+                "NewsData %s failed (%s); falling back to %s",
+                primary_path, exc, fallback_path,
             )
-            params["published_after"] = cutoff.date().isoformat()
-        if self.settings.marketaux_published_before:
-            params["published_before"] = self.settings.marketaux_published_before
-        return params
+            return self._call(fallback_path, fallback_params)
 
     def _call(self, path: str, params: dict[str, str]) -> dict[str, Any]:
         cache_key = self._cache_key(path, params)
@@ -145,39 +177,35 @@ class NewsService:
         if cached is not None:
             return cached
 
-        self._enforce_call_budget()
+        self._enforce_credit_budget()
         self._throttle()
 
-        url = self.settings.marketaux_base_url.rstrip("/") + path
-        safe_params = {k: v for k, v in params.items() if k != "api_token"}
-        logger.info("MarketAux GET %s params=%s", path, safe_params)
+        url = self.settings.news_api_base_url.rstrip("/") + path
+        safe_params = {k: v for k, v in params.items() if k != "apikey"}
+        logger.info("NewsData GET %s params=%s", path, safe_params)
 
         try:
             response = requests.get(
                 url,
                 params=params,
-                timeout=self.settings.marketaux_request_timeout_seconds,
+                timeout=self.settings.news_request_timeout_seconds,
             )
         except requests.RequestException as exc:
             raise NewsDataError(f"Network error calling {path}: {exc}") from exc
         finally:
             self._last_request_at = time.monotonic()
 
-        self._record_call()
+        self._record_credit()
 
         if response.status_code == 429:
             raise NewsCreditBudgetError(
-                "MarketAux rate limit hit (HTTP 429). Wait ~1 minute and retry."
-            )
-        if response.status_code == 402:
-            raise NewsCreditBudgetError(
-                "MarketAux usage limit reached (HTTP 402). Daily free-plan "
-                "quota is exhausted; try again tomorrow or upgrade the plan."
+                "NewsData.io rate limit hit (HTTP 429). "
+                "Free tier: 30 credits / 15 min and 200 / day. Wait and retry."
             )
         if response.status_code >= 400:
             detail = self._extract_error(response)
             raise NewsDataError(
-                f"MarketAux {path} returned HTTP {response.status_code}: {detail}"
+                f"NewsData.io {path} returned HTTP {response.status_code}: {detail}"
             )
 
         try:
@@ -185,53 +213,51 @@ class NewsService:
         except ValueError as exc:
             raise NewsDataError(f"Invalid JSON from {path}: {exc}") from exc
 
-        if isinstance(payload, dict) and "error" in payload:
-            error = payload["error"]
-            message = error.get("message") if isinstance(error, dict) else str(error)
-            raise NewsDataError(f"MarketAux {path} error: {message}")
+        if str(payload.get("status", "")).lower() != "success":
+            detail = payload.get("results") or payload.get("message") or payload
+            raise NewsDataError(f"NewsData.io {path} error: {detail}")
 
         self._store_cache(cache_key, payload)
         return payload
 
-    # ------------------------------------------------------------------
-    # Throttling / budgeting
-    # ------------------------------------------------------------------
-    def _enforce_call_budget(self) -> None:
+    def _enforce_credit_budget(self) -> None:
         now = time.time()
 
-        while self._minute_timestamps and now - self._minute_timestamps[0] > 60.0:
-            self._minute_timestamps.popleft()
-        if len(self._minute_timestamps) >= self.settings.marketaux_minute_call_limit:
+        # 15-minute rolling window
+        window = float(self.settings.news_window_seconds)
+        while self._request_timestamps and now - self._request_timestamps[0] > window:
+            self._request_timestamps.popleft()
+        if len(self._request_timestamps) >= self.settings.news_window_credit_limit:
             raise NewsCreditBudgetError(
-                "MarketAux per-minute call limit reached; wait before retrying."
+                "NewsData.io 15-minute credit limit reached; wait before retrying."
             )
 
+        # Daily budget (rolling 24h since first recorded call)
         if now - self._daily_window_start > 24 * 60 * 60:
             self._daily_window_start = now
-            self._daily_calls_used = 0
-        if self._daily_calls_used >= self.settings.marketaux_daily_call_limit:
+            self._daily_credits_used = 0
+        if self._daily_credits_used >= self.settings.news_daily_credit_limit:
             raise NewsCreditBudgetError(
-                "MarketAux daily call budget exhausted. Try again tomorrow or "
-                "upgrade the plan."
+                "NewsData.io daily credit budget exhausted. Try again tomorrow "
+                "or upgrade the plan."
             )
 
-    def _record_call(self) -> None:
-        self._minute_timestamps.append(time.time())
-        self._daily_calls_used += 1
+    def _record_credit(self) -> None:
+        now = time.time()
+        self._request_timestamps.append(now)
+        self._daily_credits_used += 1
 
     def _throttle(self) -> None:
         if self._last_request_at is None:
             return
         elapsed = time.monotonic() - self._last_request_at
-        wait_seconds = self.settings.marketaux_min_request_interval_seconds - elapsed
+        wait_seconds = self.settings.news_min_request_interval_seconds - elapsed
         if wait_seconds > 0:
             time.sleep(wait_seconds)
 
-    # ------------------------------------------------------------------
-    # Disk cache
-    # ------------------------------------------------------------------
     def _cache_key(self, path: str, params: dict[str, str]) -> str:
-        keyed = {k: v for k, v in params.items() if k != "api_token"}
+        # Exclude apikey so the cache is portable across keys.
+        keyed = {k: v for k, v in params.items() if k != "apikey"}
         raw = path + "?" + "&".join(f"{k}={keyed[k]}" for k in sorted(keyed))
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
@@ -239,7 +265,7 @@ class NewsService:
         path = self._cache_dir / f"{key}.json"
         if not path.exists():
             return None
-        ttl = timedelta(minutes=self.settings.marketaux_cache_ttl_minutes)
+        ttl = timedelta(minutes=self.settings.news_cache_ttl_minutes)
         age = datetime.now() - datetime.fromtimestamp(path.stat().st_mtime)
         if age > ttl:
             return None
@@ -255,171 +281,87 @@ class NewsService:
         except OSError:
             pass
 
-    # ------------------------------------------------------------------
-    # Article parsing / merging
-    # ------------------------------------------------------------------
     def _parse_articles(self, results: list[dict[str, Any]]) -> list[NewsArticle]:
         articles: list[NewsArticle] = []
         for item in results:
-            article_id = str(item.get("uuid") or item.get("url") or "").strip()
+            article_id = str(item.get("article_id") or item.get("link") or item.get("title") or "").strip()
             if not article_id:
                 continue
             title = (item.get("title") or "").strip()
-            description = (item.get("description") or item.get("snippet") or "").strip()
+            description = (item.get("description") or item.get("content") or "").strip()
             if not title and not description:
                 continue
+            summary = description[:2000]
 
-            tickers, match_scores, aliases, snippets = self._extract_entity_info(
-                item.get("entities")
-            )
+            tickers = self._extract_tickers(item)
+
             articles.append(
                 NewsArticle(
                     article_id=article_id,
                     title=title,
-                    summary=description[:2000],
-                    url=(item.get("url") or "").strip(),
-                    time_published=self._parse_timestamp(item.get("published_at")),
-                    source=(item.get("source") or "").strip(),
+                    summary=summary,
+                    url=(item.get("link") or "").strip(),
+                    time_published=self._parse_timestamp(item.get("pubDate")),
+                    source=(item.get("source_name") or item.get("source_id") or "").strip(),
                     tickers=tickers,
-                    ticker_match_score=match_scores,
-                    ticker_aliases=aliases,
-                    ticker_snippets=snippets,
+                    # Sentiment is populated later by SentimentService.
                 )
             )
         return articles
 
-    def _is_fresh_enough(self, article: NewsArticle) -> bool:
-        """Drop articles older than ``max_article_age_days``. Articles without
-        a parseable timestamp are kept (we'd rather err on recall than reject
-        real hits over metadata quirks)."""
-        max_age_days = self.settings.max_article_age_days
-        if max_age_days <= 0 or article.time_published is None:
-            return True
-        published = article.time_published
-        if published.tzinfo is None:
-            published = published.replace(tzinfo=timezone.utc)
-        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
-        return published >= cutoff
+    def _populate_ticker_tags(
+        self, articles: list[NewsArticle], requested_tickers: list[str]
+    ) -> None:
+        """Ensure requested tickers that appear in an article's text are tagged.
+
+        NewsData.io free tier may not populate the `symbol` field; we do a
+        safety pass so downstream scoring can distinguish articles that really
+        mention a target ticker from articles retrieved only by free-text query.
+        """
+        if not requested_tickers:
+            return
+        patterns = {
+            ticker: re.compile(rf"(?<![A-Z0-9]){re.escape(ticker)}(?![A-Z0-9])")
+            for ticker in requested_tickers
+        }
+        for article in articles:
+            text = f"{article.title} {article.summary}".upper()
+            tagged: list[str] = list(article.tickers)
+            for ticker, pattern in patterns.items():
+                if pattern.search(text) and ticker not in tagged:
+                    tagged.append(ticker)
+            article.tickers = tagged
 
     @staticmethod
-    def _merge_article(existing: NewsArticle, incoming: NewsArticle) -> None:
-        """Union ticker-specific metadata when the same article is returned for
-        multiple requested tickers."""
-        for ticker in incoming.tickers:
-            if ticker not in existing.tickers:
-                existing.tickers.append(ticker)
-        for ticker, match in incoming.ticker_match_score.items():
-            existing.ticker_match_score.setdefault(ticker, match)
-        for ticker, aliases in incoming.ticker_aliases.items():
-            merged = list(existing.ticker_aliases.get(ticker, []))
-            for alias in aliases:
-                if alias and alias not in merged:
-                    merged.append(alias)
-            existing.ticker_aliases[ticker] = merged
-        for ticker, snippets in incoming.ticker_snippets.items():
-            merged_snips = list(existing.ticker_snippets.get(ticker, []))
-            for snippet in snippets:
-                if snippet and snippet not in merged_snips:
-                    merged_snips.append(snippet)
-            existing.ticker_snippets[ticker] = merged_snips
-
-    def _apply_labels(self, article: NewsArticle) -> None:
-        article.overall_sentiment_label = self._score_to_label(
-            article.overall_sentiment_score
-        )
-
-    def _score_to_label(self, score: float) -> str:
-        if score <= self.settings.sentiment_bearish_threshold:
-            return "Bearish"
-        if score <= self.settings.sentiment_somewhat_bearish_threshold:
-            return "Somewhat-Bearish"
-        if score < self.settings.sentiment_somewhat_bullish_threshold:
-            return "Neutral"
-        if score < self.settings.sentiment_bullish_threshold:
-            return "Somewhat-Bullish"
-        return "Bullish"
-
-    @staticmethod
-    def _extract_entity_info(
-        raw: Any,
-    ) -> tuple[
-        list[str],
-        dict[str, float],
-        dict[str, list[str]],
-        dict[str, list[str]],
-    ]:
-        """Return (tickers, match_scores, aliases, snippets) from MarketAux's
-        ``entities`` array. Sentiment numbers on entities/highlights are
-        ignored -- we only carry TEXT so FinBERT can score it locally."""
+    def _extract_tickers(item: dict[str, Any]) -> list[str]:
+        raw = item.get("symbol")
         tickers: list[str] = []
-        match_scores: dict[str, float] = {}
-        aliases: dict[str, list[str]] = {}
-        snippets: dict[str, list[str]] = {}
-        if not isinstance(raw, list):
-            return tickers, match_scores, aliases, snippets
-        for entity in raw:
-            if not isinstance(entity, dict):
-                continue
-            entity_type = str(entity.get("type") or "").lower()
-            if entity_type and entity_type not in {"equity", "stock", "index"}:
-                continue
-            raw_symbol = str(entity.get("symbol") or "").strip().upper()
-            if not raw_symbol:
-                continue
-            symbol = raw_symbol.split(".", 1)[0]
-            if not symbol:
-                continue
-            if symbol not in tickers:
-                tickers.append(symbol)
-
-            match = entity.get("match_score")
-            if match is not None:
-                try:
-                    raw_match = float(match)
-                except (TypeError, ValueError):
-                    raw_match = 0.0
-                normalised = raw_match / 100.0 if raw_match > 1.0 else raw_match
-                match_scores[symbol] = max(0.0, min(1.0, normalised))
-
-            ticker_aliases = aliases.setdefault(symbol, [])
-            if symbol not in ticker_aliases:
-                ticker_aliases.append(symbol)
-            name = str(entity.get("name") or "").strip()
-            if name and name not in ticker_aliases:
-                ticker_aliases.append(name)
-
-            ticker_snippets = snippets.setdefault(symbol, [])
-            highlights = entity.get("highlights")
-            if isinstance(highlights, list):
-                for snippet in highlights:
-                    if not isinstance(snippet, dict):
-                        continue
-                    text = str(snippet.get("highlight") or "").strip()
-                    if text and text not in ticker_snippets:
-                        ticker_snippets.append(text)
-        return tickers, match_scores, aliases, snippets
+        if isinstance(raw, list):
+            for value in raw:
+                ticker = str(value).strip().upper()
+                if ticker and ticker not in tickers:
+                    tickers.append(ticker)
+        elif isinstance(raw, str) and raw:
+            for part in raw.split(","):
+                ticker = part.strip().upper()
+                if ticker and ticker not in tickers:
+                    tickers.append(ticker)
+        return tickers
 
     @staticmethod
     def _parse_timestamp(value: Any) -> datetime | None:
         if not value:
             return None
         text = str(value).strip()
-        try:
-            return datetime.fromisoformat(text.replace("Z", "+00:00"))
-        except ValueError:
-            pass
-        for fmt in (
-            "%Y-%m-%dT%H:%M:%S.%f%z",
-            "%Y-%m-%dT%H:%M:%S%z",
-            "%Y-%m-%dT%H:%M:%SZ",
-            "%Y-%m-%dT%H:%M:%S",
-            "%Y-%m-%d %H:%M:%S",
-        ):
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
             try:
                 return datetime.strptime(text, fmt)
             except ValueError:
                 continue
-        return None
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
 
     @staticmethod
     def _extract_error(response: requests.Response) -> str:
@@ -428,21 +370,15 @@ class NewsService:
         except ValueError:
             return response.text[:200]
         if isinstance(payload, dict):
-            error = payload.get("error")
-            if isinstance(error, dict):
-                return str(error.get("message") or error)
+            results = payload.get("results")
+            if isinstance(results, dict):
+                return str(results.get("message") or results)
             return str(payload.get("message") or payload)
         return str(payload)
 
     @staticmethod
-    def _build_search_clause(query: str) -> str:
-        """Turn a free-text query into a MarketAux ``search`` clause.
-
-        We OR together the meaningful keywords so MarketAux surfaces any
-        article mentioning at least one; semantic re-ranking tightens
-        relevance locally via MiniLM.
-        """
-        text = (query or "").strip()
+    def _build_query_string(query: str) -> str:
+        text = query.strip()
         if not text:
             return ""
         tokens = [
@@ -450,6 +386,7 @@ class NewsService:
             for tok in re.findall(r"[A-Za-z][A-Za-z\-]+", text)
             if tok.lower() not in _STOPWORDS and len(tok) > 2
         ]
+        # Deduplicate while preserving order.
         seen: set[str] = set()
         keywords: list[str] = []
         for tok in tokens:
@@ -458,5 +395,7 @@ class NewsService:
                 keywords.append(tok)
         if not keywords:
             return ""
-        clause = " | ".join(keywords[:8])
-        return clause[:512]
+        # Use OR so the backend returns any article mentioning at least one
+        # meaningful keyword; our semantic re-ranker tightens relevance locally.
+        q = " OR ".join(keywords[:8])
+        return q[:512]

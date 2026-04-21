@@ -31,68 +31,39 @@ class PredictionService:
         overall_semantic_score: float,
         supporting_articles: list[RetrievedArticle],
     ) -> TickerPrediction:
-        """Predict a news-driven move for a single ticker.
+        current_price = self.market_data_service.latest_close(ticker_score.ticker)
+        regression_move = self._predict_price_move(ticker_score.ticker)
 
-        Both direction AND magnitude come from news:
-
-            signed_move = sentiment * news_trust * |regression_move|
-
-        * ``sentiment``        -- ticker-scoped FinBERT in [-1, 1]; the sole
-                                  source of direction. No momentum fallback.
-        * ``news_trust``       -- blend of per-ticker and event-wide semantic
-                                  relevance in [0, 1]; dampens moves when
-                                  coverage is weakly related to the query.
-        * ``|regression_move|``-- RandomForest output on the ticker's price
-                                  history, used ONLY as a per-ticker
-                                  volatility calibrator (so a high-vol name
-                                  moves harder than a low-vol name at equal
-                                  conviction). Its sign is ignored.
-
-        Coverage dampener: if only one article contributed ticker-scoped
-        sentiment, we scale the move by sqrt(1/3) so a single outlier can't
-        produce a large prediction.
-        """
-        ticker = ticker_score.ticker
-        current_price = self.market_data_service.latest_close(ticker)
-        regression_move = self._predict_price_move(ticker)
-
+        # Direction is driven by news sentiment (signed). Semantic relevance scales
+        # how much we trust that news signal. Base drift from the price-only
+        # regression is only used when news evidence is too weak to be informative.
         sentiment_signal = float(ticker_score.sentiment_score)
         semantic_strength = max(0.0, min(1.0, float(ticker_score.semantic_score)))
         event_relevance = max(0.0, min(1.0, float(overall_semantic_score)))
         news_trust = 0.7 * semantic_strength + 0.3 * event_relevance
 
-        scored_count = sum(
-            1 for a in supporting_articles if ticker in a.article.ticker_sentiment
-        )
-        coverage_dampener = (min(scored_count, 3) / 3.0) ** 0.5
+        news_directional_signal = sentiment_signal * news_trust
+        directional_signal = news_directional_signal
+        if abs(news_directional_signal) < 0.05:
+            directional_signal = news_directional_signal + (1.0 - news_trust) * regression_move
 
-        signed_percent_move = (
-            sentiment_signal * news_trust * abs(regression_move) * coverage_dampener
-        )
+        magnitude = abs(regression_move) * (0.6 + min(abs(sentiment_signal), 1.0) + 0.4 * semantic_strength)
+        signed_percent_move = magnitude if directional_signal >= 0 else -magnitude
         predicted_price = current_price * (1.0 + signed_percent_move)
         direction = "UP" if signed_percent_move >= 0 else "DOWN"
-        # Confidence reflects conviction in the NEWS signal only; weak news
-        # -> low confidence, regardless of how jumpy the price history is.
-        confidence = logistic_confidence(
-            3.0 * abs(sentiment_signal) * news_trust * coverage_dampener
-        )
-
-        explanation = self._build_explanation(
-            ticker_score=ticker_score,
-            overall_semantic_score=overall_semantic_score,
-            signed_percent_move=signed_percent_move,
-            scored_count=scored_count,
-            supporting_articles=supporting_articles,
-        )
+        confidence = logistic_confidence(abs(directional_signal) + 0.5 * news_trust)
+        explanation = self._build_explanation(ticker_score, overall_semantic_score, signed_percent_move, supporting_articles)
 
         return TickerPrediction(
-            ticker=ticker,
+            ticker=ticker_score.ticker,
             direction=direction,
             predicted_percent_move=signed_percent_move * 100.0,
             predicted_price=predicted_price,
             current_price=current_price,
             confidence=confidence,
             semantic_score=ticker_score.semantic_score,
+            sentiment_score=ticker_score.sentiment_score,
+            combined_score=ticker_score.combined_score,
             explanation=explanation,
             supporting_articles=supporting_articles[:3],
         )
@@ -112,23 +83,13 @@ class PredictionService:
     def _build_explanation(
         ticker_score: TickerScore,
         overall_semantic_score: float,
-        signed_percent_move: float,
-        scored_count: int,
+        predicted_move: float,
         supporting_articles: list[RetrievedArticle],
     ) -> str:
-        top_titles = ", ".join(
-            a.article.title for a in supporting_articles[:2] if a.article.title
-        )
-        move_direction = "up" if signed_percent_move >= 0 else "down"
-        coverage_note = (
-            f"based on {scored_count} ticker-scoped article(s)"
-            if scored_count
-            else "no article contained ticker-scoped text to score, so the move is ~0"
-        )
+        top_titles = ", ".join(article.article.title for article in supporting_articles[:2] if article.article.title)
+        move_direction = "positive" if predicted_move >= 0 else "negative"
         return (
-            f"{ticker_score.ticker} points {move_direction}: "
-            f"ticker-scoped sentiment {ticker_score.sentiment_score:+.3f}, "
-            f"relevance {ticker_score.semantic_score:.3f}, "
-            f"event coverage {overall_semantic_score:.3f}, {coverage_note}. "
-            f"Top supporting: {top_titles or 'no strong article titles available'}."
+            f"{ticker_score.ticker} shows a {move_direction} event signal because the ticker semantic score "
+            f"({ticker_score.semantic_score:.3f}) and aggregated event relevance ({overall_semantic_score:.3f}) "
+            f"point in the same direction. Top supporting coverage: {top_titles or 'no strong article titles available'}."
         )
