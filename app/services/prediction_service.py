@@ -62,6 +62,8 @@ class PredictionService:
             current_price=current_price,
             confidence=confidence,
             semantic_score=ticker_score.semantic_score,
+            sentiment_score=ticker_score.sentiment_score,
+            combined_score=ticker_score.combined_score,
             explanation=explanation,
             supporting_articles=supporting_articles[:3],
         )

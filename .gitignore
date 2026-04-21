@@ -5,3 +5,6 @@ __pycache__/
 .env
 data/cache/*
 !data/cache/.gitkeep
+
+frontend/node_modules/
+frontend/dist/

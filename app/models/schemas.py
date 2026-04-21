@@ -52,6 +52,8 @@ class TickerPrediction(BaseModel):
     current_price: float
     confidence: float
     semantic_score: float
+    sentiment_score: float
+    combined_score: float
     explanation: str
     supporting_articles: list[RetrievedArticle]
 

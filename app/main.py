@@ -1,60 +1,22 @@
 from __future__ import annotations
 
 import json
-import re
 from datetime import datetime
 
 import typer
 
-from app.config import get_settings
+from app.factory import build_pipeline
 from app.models.schemas import EventPredictionResponse, EventRequest
-from app.services.embedding_service import EmbeddingService
-from app.services.market_data_service import MarketDataService
-from app.services.news_service import NewsService
-from app.services.pipeline_service import PipelineService
-from app.services.prediction_service import PredictionService
-from app.services.retrieval_service import RetrievalService
-from app.services.scoring_service import ScoringService
-from app.services.sentiment_service import SentimentService
+from app.ticker_normalize import TickerValidationError, normalize_tickers
 
 cli = typer.Typer(help="Predict stock impact from a hypothetical future event.")
 
 
-def _normalize_tickers(raw_tickers: list[str]) -> list[str]:
-    normalized: list[str] = []
-    for ticker_arg in raw_tickers:
-        # Accept either space-separated args or comma-separated list input.
-        for part in ticker_arg.split(","):
-            ticker = part.strip().upper()
-            if not ticker:
-                continue
-            if " " in ticker:
-                raise typer.BadParameter(
-                    "Ticker symbols cannot contain spaces. Use: "
-                    "python -m app.main predict-event \"<event>\" NVDA AMD"
-                )
-            if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", ticker):
-                raise typer.BadParameter(
-                    f"Invalid ticker symbol '{part}'. Use symbols like NVDA, AMD, BRK-B."
-                )
-            normalized.append(ticker)
-
-    if not normalized:
-        raise typer.BadParameter("Provide at least one valid ticker symbol.")
-
-    return normalized
-
-
-def build_pipeline() -> PipelineService:
-    settings = get_settings()
-    embedding_service = EmbeddingService(settings)
-    sentiment_service = SentimentService(settings)
-    news_service = NewsService(settings, sentiment_service=sentiment_service)
-    market_data_service = MarketDataService(settings)
-    retrieval_service = RetrievalService(settings, embedding_service)
-    scoring_service = ScoringService(settings)
-    prediction_service = PredictionService(settings, market_data_service)
-    return PipelineService(news_service, retrieval_service, scoring_service, prediction_service)
+def _normalize_tickers_cli(raw_tickers: list[str]) -> list[str]:
+    try:
+        return normalize_tickers(raw_tickers)
+    except TickerValidationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 def _format_timestamp(value: datetime | None) -> str:
@@ -83,6 +45,8 @@ def _format_report(response: EventPredictionResponse) -> str:
         lines.append(f"Predicted Price: ${prediction.predicted_price:.2f}")
         lines.append(f"Confidence: {prediction.confidence:.3f}")
         lines.append(f"Ticker Semantic Score: {prediction.semantic_score:.3f}")
+        lines.append(f"Sentiment Score: {prediction.sentiment_score:.3f}")
+        lines.append(f"Combined Score: {prediction.combined_score:.3f}")
         lines.append(f"Explanation: {prediction.explanation}")
         lines.append("")
         lines.append(f"Supporting Articles ({len(prediction.supporting_articles)} shown):")
@@ -116,7 +80,7 @@ def predict_event(
     top_k: int = typer.Option(8, min=1, help="Number of supporting articles to keep."),
     json_output: bool = typer.Option(False, "--json", help="Output raw JSON instead of formatted report."),
 ) -> None:
-    normalized_tickers = _normalize_tickers(tickers)
+    normalized_tickers = _normalize_tickers_cli(tickers)
     pipeline = build_pipeline()
     response = pipeline.run(
         EventRequest(

@@ -41,3 +41,19 @@ For each ticker, the app returns:
 - a short explanation
 
 Pass `--json` for raw JSON output.
+
+## Web dashboard
+
+Run the API and the Vite dev server in **two terminals** from the project root (with `.env` containing `NEWS_API_KEY`):
+
+```bash
+.venv/bin/uvicorn app.api_main:app --reload --port 8000
+```
+
+```bash
+cd frontend && npm install && npm run dev
+```
+
+Open `http://localhost:5173`. The UI proxies `/api` to `http://127.0.0.1:8000` by default; override with `VITE_API_TARGET` if the API runs elsewhere.
+
+The first prediction after starting the API can take several minutes while FinBERT and embedding models load.
