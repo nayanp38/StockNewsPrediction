@@ -57,3 +57,33 @@ cd frontend && npm install && npm run dev
 Open `http://localhost:5173`. The UI proxies `/api` to `http://127.0.0.1:8000` by default; override with `VITE_API_TARGET` if the API runs elsewhere.
 
 The first prediction after starting the API can take several minutes while FinBERT and embedding models load.
+
+## Bayesian T+1 workflow
+
+The Bayesian path is feature-flagged and falls back to the legacy predictor if no artifact is available.
+
+1. Build a supervised dataset from historical event responses:
+
+```bash
+python -m app.bayesian_main build-dataset --input-jsonl data/training/events_history.jsonl
+```
+
+2. Train and export a Bayesian artifact:
+
+```bash
+python -m app.bayesian_main train --dataset-csv data/training/events_t1_dataset.csv --artifact-path data/models/bayesian_t1_artifact.json
+```
+
+3. Evaluate against a sentiment-only baseline:
+
+```bash
+python -m app.bayesian_main evaluate --dataset-csv data/training/events_t1_dataset.csv --artifact-path data/models/bayesian_t1_artifact.json
+```
+
+4. Enable serving in `.env`:
+
+```bash
+BAYESIAN_ENABLED=true
+BAYESIAN_SHADOW_MODE=false
+BAYESIAN_ARTIFACT_PATH=data/models/bayesian_t1_artifact.json
+```

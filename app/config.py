@@ -50,6 +50,14 @@ class Settings(BaseSettings):
     sentiment_somewhat_bullish_threshold: float = 0.15
     sentiment_bullish_threshold: float = 0.35
 
+    # Bayesian T+1 serving/training controls.
+    bayesian_enabled: bool = False
+    bayesian_shadow_mode: bool = True
+    bayesian_direction_threshold: float = 0.5
+    bayesian_artifact_path: str = "data/models/bayesian_t1_artifact.json"
+    bayesian_train_dataset_path: str = "data/training/events_t1_dataset.csv"
+    bayesian_min_rows: int = 200
+
     model_config = SettingsConfigDict(populate_by_name=True, extra="ignore")
 
 
